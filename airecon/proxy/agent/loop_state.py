@@ -321,6 +321,11 @@ class _StateMixin:
             saved += 1
 
         self._persisted_memory_finding_keys = persisted  # type: ignore[attr-defined]
+        if saved and hasattr(self, "_ensure_adaptive_learning_engine"):
+            try:
+                self._ensure_adaptive_learning_engine().attribute_hit()
+            except Exception as exc:
+                logger.debug("Memory recall attribution failed: %s", exc)
         return saved
 
     def _save_recon_exploit_pattern(

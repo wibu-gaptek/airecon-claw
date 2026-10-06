@@ -2086,6 +2086,7 @@ class AIReconApp(App):
                 "- /think true|false     Enable/disable thinking\n"
                 "- /shell <command>      Run command in AIRecon Kali Docker shell\n"
                 "- /scope ...            Scope guard: allow/deny <hosts>, mode <off|warn|block>, show, clear\n"
+                "- /brain                Show what the agent has learned (cross-session memory)\n"
                 "- /reset                Reset conversation\n"
                 "- /clear                Clear chat display\n\n"
                 "Note: For authenticated MCP endpoint, use auth:user/pass or auth:apikey:<token> after URL."
@@ -2328,6 +2329,44 @@ class AIReconApp(App):
                     )
             except Exception as e:
                 chat.add_error_message(f"Scope request failed: {e}")
+            return
+
+        elif cmd == "/brain" or cmd.startswith("/brain "):
+            try:
+                resp = await self._http.get("/api/brain", timeout=10.0)
+                data = resp.json() if resp.content else {}
+            except Exception as e:
+                chat.add_error_message(f"Brain request failed: {e}")
+                return
+            if resp.status_code != 200 or data.get("error"):
+                chat.add_error_message(
+                    f"Brain unavailable: {data.get('error', resp.text)}"
+                )
+                return
+            s = data.get("summary", {})
+            lines = [
+                "[brain]",
+                f"  insights:      {s.get('total_insights', 0)}",
+                f"  observations:  {s.get('total_observations', 0)}",
+                f"  tools tracked: {s.get('total_tools_tracked', 0)}",
+                f"  strategies:    {s.get('total_patterns_learned', 0)}",
+                "  retrieval:     "
+                + (
+                    f"semantic ({data.get('embedding_model', '?')})"
+                    if data.get("semantic_recall")
+                    else "lexical"
+                ),
+            ]
+            insights = data.get("insights", [])
+            if insights:
+                lines.append("  top insights:")
+                for ins in insights[:10]:
+                    lines.append(
+                        f"    [{ins.get('category')}] {ins.get('title')} "
+                        f"(conf {float(ins.get('confidence', 0)):.2f}, "
+                        f"recalls {ins.get('recalls', 0)}, hits {ins.get('hits', 0)})"
+                    )
+            chat.add_assistant_message("\n".join(lines), markup=False)
             return
 
         elif cmd.startswith("/mcp"):
@@ -2577,6 +2616,7 @@ class AIReconApp(App):
 - /models: List/switch OpenAI-compatible models.
 - /think true|false: Enable/disable thinking.
 - /shell <command>: Run command in AIRecon Kali Docker shell.
+- /brain: Show what the agent has learned (cross-session memory).
 - /reset: Reset conversation.
 - /clear: Clear chat history.
 

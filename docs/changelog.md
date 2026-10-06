@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added — semantic cross-session brain
+- feat(memory): the agent now recalls past experience by **meaning**, not exact target/category match. New `airecon/proxy/brain.py` holds dependency-free vector primitives (float32 BLOB pack/unpack, pure-Python cosine); `LLMClient.embed()` calls the gateway's `/v1/embeddings` reusing the existing host/auth/httpx plumbing — no new dependency. When `embedding_model` is empty or the endpoint is unavailable, recall degrades cleanly to the existing lexical path.
+- feat(memory): new `embeddings` and `memory_utility` tables in `airecon.db`. Distilled insights are embedded and, when cosine >= `intelligence_dedup_threshold`, merged into the nearest existing insight instead of appended — so the brain stops accumulating near-duplicates across sessions.
+- feat(intelligence): distillation now learns from **failures** as well as successes ("avoid X when Y"), stored at lower confidence (0.35 vs 0.6). Because failed attempts now contribute, per-cycle insight yield rises (up to 5/cycle).
+- feat(intelligence): utility tracking + forgetting. Verified findings credit the insights recalled before them; insights whose hit-rate stays below `intelligence_utility_floor` after >=3 recalls, or that are stale past `intelligence_insight_ttl_days` at low confidence, are pruned. `_inject_learned_insights` merges semantic + lexical hits.
+- feat(server/tui): `GET /api/brain` and `/brain` show what the agent has learned (insight count, retrieval mode, top insights with confidence/recalls/hits).
+- feat(config): new keys `intelligence_semantic_recall`, `intelligence_embeddings_enabled`, `embedding_model`, `intelligence_dedup_threshold`, `intelligence_utility_floor`, `intelligence_insight_ttl_days`, registered as essential so existing configs migrate on next load.
+- test(brain): `tests/proxy/test_brain.py` — vector round-trip/cosine edge cases, embed-availability fallback, semantic recall ranking, dedup vs distinct, utility-based prune/keep, and end-to-end failure-learning + vector persistence.
+
 ### Added — dual-protocol LLM client (OpenAI + Anthropic/Claude)
 - feat(llm): `LLMClient` now speaks **two** wire formats selected by a new `llm_provider` key. `openai` (default) keeps the existing `POST {base_url}/chat/completions` path; `anthropic` uses `POST {base_url}/messages` (Anthropic Messages API — real Claude, or any gateway exposing the Anthropic-compatible surface). Both yield the identical LLM-chunk contract, so the agent loop, executors and tools are untouched.
 - feat(llm): full Anthropic mapping — `system` is extracted to the top-level `system` string; tool calls become `tool_use` blocks and tool results become `tool_result` blocks (reusing the OpenAI path's FIFO id-binding and orphan-drop rules); consecutive same-role turns are coalesced for role-alternation; native tools convert to `input_schema`; thinking streams via `thinking_delta` and is requested with `thinking: {type: enabled, budget_tokens}` on the agent's `think` decision. Auth sends both `x-api-key` + `anthropic-version: 2023-06-01` and `Authorization: Bearer` for gateway compatibility. No SDK added (httpx only).

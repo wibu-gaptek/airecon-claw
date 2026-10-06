@@ -764,6 +764,37 @@ _CONFIG_SCHEMA: dict[str, tuple[Any, str]] = {
         "When intelligence_learn_only_verified is on, an unverified finding is "
         "still learned if its verified_confidence is at least this value.",
     ),
+    "intelligence_semantic_recall": (
+        True,
+        "Use vector (embedding) similarity to recall cross-target experience "
+        "instead of exact target/category match. Falls back to lexical matching "
+        "when no embeddings endpoint is available.",
+    ),
+    "intelligence_embeddings_enabled": (
+        True,
+        "Use the gateway's /v1/embeddings endpoint to embed experience for "
+        "semantic recall. Requires embedding_model to be set.",
+    ),
+    "embedding_model": (
+        "",
+        "Embedding model id exposed by the gateway (e.g. 'text-embedding-3-small', "
+        "'bge-m3', 'nomic-embed-text'). Empty disables embeddings -> lexical fallback.",
+    ),
+    "intelligence_dedup_threshold": (
+        0.90,
+        "Semantic-similarity threshold above which a newly distilled insight is "
+        "merged into an existing one instead of appended (dedup).",
+    ),
+    "intelligence_utility_floor": (
+        0.2,
+        "Insights whose (decayed) utility falls below this floor after enough "
+        "recalls are pruned. Keeps the brain compact and high-signal.",
+    ),
+    "intelligence_insight_ttl_days": (
+        90,
+        "Days after which an unused, low-confidence insight is treated as stale "
+        "and pruned. Higher = more conservative forgetting.",
+    ),
     "intelligence_generative_fuzzing_enabled": (
         True,
         "Enable generative fuzzing engine with genetic algorithm payload evolution.",
@@ -887,6 +918,12 @@ _CONFIG_CATEGORIES = [
             "intelligence_correlation_interval",
             "intelligence_learn_only_verified",
             "intelligence_learn_min_confidence",
+            "intelligence_semantic_recall",
+            "intelligence_embeddings_enabled",
+            "embedding_model",
+            "intelligence_dedup_threshold",
+            "intelligence_utility_floor",
+            "intelligence_insight_ttl_days",
             "memory_protected_context_max",
             "memory_compression_summary_chars",
             "memory_compression_input_per_msg_chars",
@@ -1050,6 +1087,12 @@ _CONFIG_CATEGORIES = [
             "intelligence_enabled",
             "intelligence_adaptive_learning_enabled",
             "intelligence_adaptive_min_observations",
+            "intelligence_semantic_recall",
+            "intelligence_embeddings_enabled",
+            "embedding_model",
+            "intelligence_dedup_threshold",
+            "intelligence_utility_floor",
+            "intelligence_insight_ttl_days",
             "intelligence_generative_fuzzing_enabled",
             "intelligence_generative_population_size",
             "intelligence_generative_max_generations",
@@ -1155,6 +1198,12 @@ _ESSENTIAL_CONFIG_KEYS: set[str] = {
     "intelligence_correlation_interval",
     "intelligence_learn_only_verified",
     "intelligence_learn_min_confidence",
+    "intelligence_semantic_recall",
+    "intelligence_embeddings_enabled",
+    "embedding_model",
+    "intelligence_dedup_threshold",
+    "intelligence_utility_floor",
+    "intelligence_insight_ttl_days",
     "memory_protected_context_max",
     "memory_compression_summary_chars",
     "memory_compression_input_per_msg_chars",
@@ -1472,6 +1521,12 @@ class Config:
     intelligence_correlation_interval: int
     intelligence_learn_only_verified: bool
     intelligence_learn_min_confidence: float
+    intelligence_semantic_recall: bool
+    intelligence_embeddings_enabled: bool
+    embedding_model: str
+    intelligence_dedup_threshold: float
+    intelligence_utility_floor: float
+    intelligence_insight_ttl_days: int
     intelligence_generative_fuzzing_enabled: bool
     intelligence_generative_population_size: int
     intelligence_generative_max_generations: int
@@ -1770,6 +1825,9 @@ class Config:
             "verification_timeout": (5, 120),
             # Intelligence
             "intelligence_adaptive_min_observations": (1, 20),
+            "intelligence_dedup_threshold": (0.5, 1.0),
+            "intelligence_utility_floor": (0.0, 1.0),
+            "intelligence_insight_ttl_days": (1, 3650),
             "intelligence_generative_population_size": (10, 500),
             "intelligence_generative_max_generations": (1, 100),
             # Payload memory
