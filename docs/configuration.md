@@ -13,6 +13,7 @@
 6. [Server Settings](#6-server-settings)
 7. [Safety Settings](#7-safety-settings)
 8. [Browser Settings](#8-browser-settings)
+   - [Cross-Session Brain (Semantic Memory)](#cross-session-brain-semantic-memory)
 9. [Search Settings](#9-search-settings)
 10. [Session Settings](#10-session-settings)
 11. [Environment Variable Overrides](#11-environment-variable-overrides)
@@ -530,6 +531,29 @@ The message role used when returning tool results to the LLM in the conversation
 | `"user"` | Fallback for older models that don't understand the tool role |
 
 Most models work correctly with `"tool"`. If you see the model failing to parse tool results, try `"user"`.
+
+---
+
+### Cross-Session Brain (Semantic Memory)
+
+The agent distills insights from past sessions into `~/.airecon/memory/airecon.db`
+and recalls them on new targets. With an embedding model configured, recall is by
+**semantic similarity** (so a new nginx box benefits from a past nginx engagement)
+instead of exact target/category match. Without one, recall falls back to lexical
+matching automatically — nothing breaks.
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `intelligence_semantic_recall` | `true` | Prefer vector recall over lexical match. |
+| `intelligence_embeddings_enabled` | `true` | Call the gateway's `/v1/embeddings`. |
+| `embedding_model` | `""` | Embedding model id (e.g. `text-embedding-3-small`, `bge-m3`). Empty ⇒ lexical only. |
+| `intelligence_dedup_threshold` | `0.90` | Cosine ≥ this merges a new insight into an existing one. |
+| `intelligence_utility_floor` | `0.2` | Prune an insight whose hit-rate falls below this after ≥3 recalls. |
+| `intelligence_insight_ttl_days` | `90` | Stale, low-confidence, never-recalled insights are dropped after this. |
+
+Distillation also learns from **failed** attempts ("avoid X when Y"), stored at
+lower confidence than success-derived lessons. Verified findings credit the
+insights that were recalled before them, so dead weight gets pruned over time.
 
 ---
 

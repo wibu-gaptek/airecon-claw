@@ -1097,6 +1097,45 @@ async def get_diagnostics() -> JSONResponse:
     return JSONResponse(health_status)
 
 
+@app.get("/api/brain")
+async def get_brain() -> ORJSONResponse:
+    if not agent or not hasattr(agent, "_ensure_adaptive_learning_engine"):
+        return ORJSONResponse({"error": "agent not initialized"}, status_code=503)
+    try:
+        engine = agent._ensure_adaptive_learning_engine()
+        summary = engine.get_learning_summary()
+        insights = sorted(
+            engine.learned_insights,
+            key=lambda i: (i.confidence, i.last_updated),
+            reverse=True,
+        )[:30]
+        utility = engine._utility_map()
+        return ORJSONResponse(
+            {
+                "summary": summary,
+                "semantic_recall": bool(getattr(engine, "_semantic_recall", False)),
+                "embedding_model": getattr(engine, "_embedding_model", ""),
+                "insights": [
+                    {
+                        "id": ins.insight_id,
+                        "category": ins.category,
+                        "title": ins.title,
+                        "recommendation": ins.recommendation,
+                        "conditions": ins.conditions,
+                        "confidence": ins.confidence,
+                        "observations": ins.observation_count,
+                        "last_updated": ins.last_updated,
+                        "recalls": utility.get(ins.insight_id, {}).get("recalls", 0),
+                        "hits": utility.get(ins.insight_id, {}).get("hits", 0),
+                    }
+                    for ins in insights
+                ],
+            }
+        )
+    except Exception as e:
+        return ORJSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.get("/api/models")
 async def list_models() -> ORJSONResponse:
     cfg = get_config()

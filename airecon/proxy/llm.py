@@ -449,6 +449,60 @@ class LLMClient:
         headers["Authorization"] = f"Bearer {self._api_key}"
         return headers
 
+    async def embed(
+        self, texts: list[str], model: str | None = None
+    ) -> list[list[float]] | None:
+        """Embed texts via the gateway's /v1/embeddings endpoint.
+
+        Reuses the same host, auth headers and shared httpx client as chat, so no
+        new dependency is needed. Returns None (never raises) when embeddings are
+        unavailable — no embedding_model configured, endpoint missing, or the
+        gateway returns an error — so callers can fall back to lexical retrieval.
+        """
+        cfg = get_config()
+        embed_model = (model or getattr(cfg, "embedding_model", "") or "").strip()
+        if not embed_model or not texts:
+            return None
+        if not bool(getattr(cfg, "intelligence_embeddings_enabled", True)):
+            return None
+
+        try:
+            await self._async_init()
+        except Exception as exc:  # pragma: no cover - init failure is non-fatal
+            logger.debug("embed: client init failed: %s", exc)
+            return None
+
+        payload: dict[str, Any] = {"model": embed_model, "input": texts}
+        timeout = min(float(getattr(cfg, "llm_timeout", 30.0) or 30.0), 60.0)
+        try:
+            resp = await self._post("/embeddings", payload, timeout)
+            if resp.status_code >= 400:
+                logger.debug(
+                    "embed: /embeddings returned HTTP %d for model=%s",
+                    resp.status_code,
+                    embed_model,
+                )
+                return None
+            data = resp.json()
+        except Exception as exc:
+            logger.debug("embed: request failed: %s", exc)
+            return None
+
+        rows = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return None
+        # Preserve input order (OpenAI returns an `index` per row).
+        try:
+            ordered = sorted(rows, key=lambda r: int(r.get("index", 0)))
+            vectors = [r.get("embedding") for r in ordered]
+        except Exception:
+            vectors = [r.get("embedding") for r in rows]
+        if len(vectors) != len(texts) or not all(
+            isinstance(v, list) and v for v in vectors
+        ):
+            return None
+        return [[float(x) for x in v] for v in vectors]  # type: ignore[arg-type]
+
     def _apply_options(
         self, payload: dict[str, Any], options: dict[str, Any] | None
     ) -> None:

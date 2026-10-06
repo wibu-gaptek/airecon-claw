@@ -12,6 +12,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..brain import cosine as _cosine
+from ..brain import pack_vector as _pack_vector
+from ..brain import unpack_vector as _unpack_vector
 from ..memory import (
     MemoryManager,
     _init_schema,
@@ -172,10 +175,44 @@ class AdaptiveLearningEngine:
         self.learned_insights: list[LearnedInsight] = []
         self.observation_log: list[ObservationLog] = []
 
+        # Semantic-recall config (all optional; lexical mode when unavailable).
+        self._semantic_recall = False
+        self._embedding_model = ""
+        self._dedup_threshold = 0.90
+        self._utility_floor = 0.2
+        self._insight_ttl_days = 90
+        self._insight_vectors: dict[str, list[float]] = {}
+        self._vectors_dirty = True
+        self._pending_recall_refs: set[int] = set()
+        self._load_brain_config()
+
         # Load persistent state from disk + airencon.db
         self._load_state()
         self._import_from_memory_db()
         self._bootstrap_insights_from_patterns()
+
+    def _load_brain_config(self) -> None:
+        try:
+            from ..config import get_config
+
+            cfg = get_config()
+            self._semantic_recall = bool(
+                getattr(cfg, "intelligence_semantic_recall", True)
+            )
+            self._embedding_model = str(
+                getattr(cfg, "embedding_model", "") or ""
+            ).strip()
+            self._dedup_threshold = float(
+                getattr(cfg, "intelligence_dedup_threshold", 0.90)
+            )
+            self._utility_floor = float(
+                getattr(cfg, "intelligence_utility_floor", 0.2)
+            )
+            self._insight_ttl_days = int(
+                getattr(cfg, "intelligence_insight_ttl_days", 90)
+            )
+        except Exception as exc:
+            logger.debug("Brain config load failed: %s", exc)
 
     # ── Persistence ──────────────────────────────────────────────────────────
 
@@ -345,32 +382,66 @@ class AdaptiveLearningEngine:
             normalized[key_name] = self._normalize_condition_value(key_name, value)
         return normalized
 
+    def _merge_insight(
+        self, existing: LearnedInsight, insight: LearnedInsight
+    ) -> LearnedInsight:
+        existing.title = insight.title or existing.title
+        existing.description = insight.description or existing.description
+        existing.recommendation = insight.recommendation or existing.recommendation
+        existing.category = insight.category or existing.category
+        existing.conditions.update(insight.conditions or {})
+        existing.confidence = max(existing.confidence, insight.confidence)
+        existing.observation_count = max(
+            existing.observation_count,
+            insight.observation_count,
+        )
+        existing.last_updated = max(existing.last_updated, insight.last_updated)
+        existing.session_ids = sorted(
+            {
+                str(session_id)
+                for session_id in [*existing.session_ids, *insight.session_ids]
+                if str(session_id).strip()
+            }
+        )
+        return existing
+
+    def _nearest_insight(
+        self, vector: list[float], exclude_id: str = ""
+    ) -> tuple[LearnedInsight | None, float]:
+        best: LearnedInsight | None = None
+        best_score = 0.0
+        for existing in self.learned_insights:
+            if existing.insight_id == exclude_id:
+                continue
+            vec = self._insight_vectors.get(existing.insight_id)
+            if not vec:
+                continue
+            score = _cosine(vec, vector)
+            if score > best_score:
+                best_score = score
+                best = existing
+        return best, best_score
+
     def _store_learned_insight(
         self,
         insight: LearnedInsight,
+        vector: list[float] | None = None,
     ) -> tuple[LearnedInsight, bool]:
         for existing in self.learned_insights:
             if existing.insight_id != insight.insight_id:
                 continue
-            existing.title = insight.title or existing.title
-            existing.description = insight.description or existing.description
-            existing.recommendation = insight.recommendation or existing.recommendation
-            existing.category = insight.category or existing.category
-            existing.conditions.update(insight.conditions or {})
-            existing.confidence = max(existing.confidence, insight.confidence)
-            existing.observation_count = max(
-                existing.observation_count,
-                insight.observation_count,
-            )
-            existing.last_updated = max(existing.last_updated, insight.last_updated)
-            existing.session_ids = sorted(
-                {
-                    str(session_id)
-                    for session_id in [*existing.session_ids, *insight.session_ids]
-                    if str(session_id).strip()
-                }
-            )
-            return existing, False
+            return self._merge_insight(existing, insight), False
+
+        if vector is not None:
+            nearest, score = self._nearest_insight(vector)
+            if nearest is not None and score >= self._dedup_threshold:
+                logger.debug(
+                    "[AdaptiveLearning] Semantic dedup: '%s' merged into '%s' (sim=%.3f)",
+                    insight.title,
+                    nearest.title,
+                    score,
+                )
+                return self._merge_insight(nearest, insight), False
 
         self.learned_insights.append(insight)
         return insight, True
@@ -436,6 +507,237 @@ class AdaptiveLearningEngine:
                 "Failed to persist distilled insights to memory DB: %s",
                 exc,
             )
+
+    # ── Semantic recall + utility (the cross-session "brain") ────────────────
+
+    @staticmethod
+    def _insight_embed_text(insight: dict[str, Any] | LearnedInsight) -> str:
+        if isinstance(insight, LearnedInsight):
+            title = insight.title
+            recommendation = insight.recommendation
+            conditions = insight.conditions
+        else:
+            title = insight.get("title", "")
+            recommendation = insight.get("recommendation", "")
+            conditions = insight.get("conditions", {})
+        cond_str = json.dumps(conditions or {}, sort_keys=True)
+        return f"{title} | {recommendation} | {cond_str}"
+
+    def _embed_texts(
+        self,
+        texts: list[str],
+        base_url: str = "",
+        model: str = "",
+        api_key: str = "",
+    ) -> list[list[float]]:
+        if not texts or not self._embedding_model:
+            return []
+        try:
+            from ..llm import LLMClient
+
+            client = LLMClient(base_url=base_url or None, model=model or None)
+            embed_model = self._embedding_model
+
+            async def _call():
+                await client._async_init()
+                return await client.embed(list(texts), model=embed_model)
+
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return asyncio.run(_call()) or []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                return executor.submit(lambda: asyncio.run(_call())).result(
+                    timeout=60
+                ) or []
+        except Exception as exc:
+            logger.debug("[AdaptiveLearning] Embedding failed: %s", exc)
+            return []
+
+    def _persist_insight_vectors(self, insights: list[LearnedInsight]) -> None:
+        rows = [
+            (ins, self._insight_vectors.get(ins.insight_id))
+            for ins in insights
+        ]
+        rows = [(ins, vec) for ins, vec in rows if vec]
+        if not rows:
+            return
+        try:
+            conn = _open_memory_db(read_only=False)
+            _init_schema(conn)
+            memory = MemoryManager()
+            memory.conn = conn
+            try:
+                for ins, vec in rows:
+                    memory.upsert_embedding(
+                        "insight",
+                        _insight_ref_id(ins.insight_id),
+                        self._embedding_model,
+                        _pack_vector(vec),
+                        len(vec),
+                    )
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.debug("Failed to persist insight vectors: %s", exc)
+
+    def _load_insight_vectors(self) -> None:
+        if not self.learned_insights or not _MEMORY_DB.exists():
+            return
+        try:
+            conn = _open_memory_db(read_only=True)
+            memory = MemoryManager()
+            memory.conn = conn
+            try:
+                by_ref = {
+                    _insight_ref_id(i.insight_id): i.insight_id
+                    for i in self.learned_insights
+                }
+                rows = memory.get_embeddings(
+                    "insight", model=self._embedding_model or None
+                )
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.debug("Failed to load insight vectors: %s", exc)
+            return
+        for row in rows:
+            insight_id = by_ref.get(int(row["ref_id"]))
+            if insight_id:
+                self._insight_vectors[insight_id] = _unpack_vector(
+                    row["vector"], int(row["dim"])
+                )
+        if self._insight_vectors:
+            logger.info(
+                "[AdaptiveLearning] Loaded %d insight vectors for semantic recall",
+                len(self._insight_vectors),
+            )
+
+    def build_recall_query(
+        self, phase: str, tech_stack: list[str], target: str = ""
+    ) -> str:
+        parts = [f"phase={phase}"]
+        techs = [str(t).strip() for t in (tech_stack or []) if str(t).strip()]
+        if techs:
+            parts.append("technologies: " + ", ".join(sorted(techs)[:12]))
+        if target:
+            parts.append(f"target: {target}")
+        return " | ".join(parts)
+
+    def get_insights_semantic(
+        self,
+        phase: str,
+        tech_stack: list[str],
+        target: str = "",
+        base_url: str = "",
+        model: str = "",
+        api_key: str = "",
+        limit: int = 10,
+    ) -> list[LearnedInsight]:
+        if not self._semantic_recall or not self._embedding_model:
+            return []
+        if self._vectors_dirty or not self._insight_vectors:
+            self._load_insight_vectors()
+            self._vectors_dirty = False
+        if not self._insight_vectors:
+            return []
+
+        query = self.build_recall_query(phase, tech_stack, target)
+        vectors = self._embed_texts(
+            [query], base_url=base_url, model=model, api_key=api_key
+        )
+        if not vectors:
+            return []
+        query_vec = vectors[0]
+
+        by_id = {i.insight_id: i for i in self.learned_insights}
+        scored: list[tuple[float, LearnedInsight]] = []
+        for insight_id, vec in self._insight_vectors.items():
+            insight = by_id.get(insight_id)
+            if insight is None or len(vec) != len(query_vec):
+                continue
+            scored.append((_cosine(query_vec, vec), insight))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [ins for sim, ins in scored[:limit] if sim >= 0.25]
+
+    def record_recall(self, insights: list[LearnedInsight]) -> None:
+        refs = {_insight_ref_id(i.insight_id) for i in insights if i.insight_id}
+        if not refs:
+            return
+        self._pending_recall_refs |= refs
+        self._bump_utility(refs, hit=False)
+
+    def attribute_hit(self) -> None:
+        refs = set(self._pending_recall_refs)
+        self._pending_recall_refs.clear()
+        if refs:
+            self._bump_utility(refs, hit=True)
+
+    def _bump_utility(self, refs: set[int], hit: bool) -> None:
+        if not refs:
+            return
+        try:
+            conn = _open_memory_db(read_only=False)
+            _init_schema(conn)
+            memory = MemoryManager()
+            memory.conn = conn
+            try:
+                memory.bump_utility("insight", sorted(refs), hit=hit)
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.debug("Failed to bump memory utility: %s", exc)
+
+    def _prune_learned_insights(self) -> None:
+        if not self.learned_insights:
+            return
+        try:
+            conn = _open_memory_db(read_only=True)
+            memory = MemoryManager()
+            memory.conn = conn
+            try:
+                utility = memory.get_utility("insight")
+            finally:
+                conn.close()
+        except Exception:
+            utility = {}
+
+        now = time.time()
+        ttl_seconds = max(1, self._insight_ttl_days) * 86400
+        kept: list[LearnedInsight] = []
+        pruned: list[str] = []
+        for insight in self.learned_insights:
+            if "bootstrap" in insight.session_ids or self.session_id in insight.session_ids:
+                kept.append(insight)
+                continue
+            usage = utility.get(_insight_ref_id(insight.insight_id))
+            if usage and int(usage.get("recalls") or 0) >= 3:
+                hit_rate = int(usage.get("hits") or 0) / max(
+                    1, int(usage.get("recalls") or 1)
+                )
+                if hit_rate < self._utility_floor:
+                    pruned.append(insight.insight_id)
+                    continue
+            age = now - (insight.last_updated or insight.created_at or now)
+            if age > ttl_seconds and insight.confidence < 0.5:
+                pruned.append(insight.insight_id)
+                continue
+            kept.append(insight)
+
+        if not pruned:
+            return
+        pruned_set = set(pruned)
+        self.learned_insights = [
+            i for i in self.learned_insights if i.insight_id not in pruned_set
+        ]
+        for insight_id in pruned:
+            self._insight_vectors.pop(insight_id, None)
+        self._vectors_dirty = True
+        logger.info(
+            "[AdaptiveLearning] Pruned %d low-utility/stale insights (kept %d)",
+            len(pruned),
+            len(self.learned_insights),
+        )
 
     def _sync_to_memory_db(self) -> None:
         """Sync learned tool performance back to ~/.airecon/memory/airecon.db."""
@@ -865,10 +1167,11 @@ class AdaptiveLearningEngine:
             logger.debug("distill_insights: no LLM config, skipping")
             return []
 
-        # Only distill if we have enough new observations
+        # Distill from success AND failure: the corrective "avoid X when Y" signal
+        # in failed attempts is the highest-value lesson (see ReMe/MPR research).
         new_obs = [
             o for o in self.observation_log
-            if o.success and len(self.observation_log) >= self.min_observations * 3
+            if len(self.observation_log) >= self.min_observations * 3
         ]
         if not new_obs:
             return []
@@ -881,18 +1184,22 @@ class AdaptiveLearningEngine:
 
         prompt = (
             "You are a security research analyst. Below are recent observations "
-            "from an automated penetration testing session.\n\n"
+            "from an automated penetration testing session, including both "
+            "successes and FAILURES.\n\n"
             f"Observations:\n{obs_text}\n\n"
-            "Identify patterns and generate up to 3 generalized insights.\n"
+            "Generate up to 5 generalized insights. Learn from successes "
+            "(what works) and failures (what to avoid, and why).\n"
             "Each insight should have:\n"
             "- category: one of [tool_tech, vuln_pattern, exploit_chain, doc_pattern]\n"
             "- title: short description of the pattern\n"
             "- conditions: JSON object of when this applies (e.g., {\"tech\": \"nginx\"})\n"
             "- recommendation: what action to take when conditions match\n"
+            "- outcome: \"success\" or \"failure\" (which outcome this lesson is from)\n"
             "Respond ONLY with a JSON array of insight objects.\n"
-            "Each object must have: category, title, conditions, recommendation.\n"
+            "Each object must have: category, title, conditions, recommendation, outcome.\n"
             "Example: [{\"category\": \"vuln_pattern\", \"title\": \"nginx exposes server version\", "
-            "\"conditions\": {\"tech\": \"nginx\"}, \"recommendation\": \"Check Server header for version leak\"}]"
+            "\"conditions\": {\"tech\": \"nginx\"}, \"recommendation\": \"Check Server header for version leak\", "
+            "\"outcome\": \"success\"}]"
         )
 
         try:
@@ -923,10 +1230,17 @@ class AdaptiveLearningEngine:
                     )
 
             new_insights = _parse_insights_json(raw_answer)
+            outcome_vectors = self._embed_texts(
+                [self._insight_embed_text(i) for i in new_insights],
+                base_url=base_url,
+                model=model,
+                api_key=api_key,
+            )
             added: list[LearnedInsight] = []
-            for ins in new_insights:
+            for idx, ins in enumerate(new_insights):
                 conditions = self._normalize_conditions(ins.get("conditions", {}))
                 now = time.time()
+                is_failure = str(ins.get("outcome", "")).strip().lower() == "failure"
                 insight = LearnedInsight(
                     insight_id=self._make_pattern_id(
                         conditions,
@@ -937,21 +1251,30 @@ class AdaptiveLearningEngine:
                     description=ins.get("recommendation", ""),
                     conditions=conditions,
                     recommendation=ins.get("recommendation", ""),
-                    confidence=0.6,
+                    confidence=0.35 if is_failure else 0.6,
                     observation_count=len(new_obs),
                     created_at=now,
                     last_updated=now,
                     session_ids=[self.session_id],
                 )
-                stored, created = self._store_learned_insight(insight)
+                vector = outcome_vectors[idx] if idx < len(outcome_vectors) else None
+                stored, created = self._store_learned_insight(insight, vector=vector)
                 if not created:
                     continue
+                if vector is not None:
+                    self._insight_vectors[stored.insight_id] = vector
+                    self._vectors_dirty = True
                 added.append(stored)
                 logger.info(
-                    "[AdaptiveLearning] New insight distilled: %s",
+                    "[AdaptiveLearning] New insight distilled (%s): %s",
+                    "failure" if is_failure else "success",
                     stored.title,
                 )
             self._persist_insights_to_memory_db(added)
+            if added:
+                self._persist_insight_vectors(added)
+                self._prune_learned_insights()
+                self.save_state()
             return added
 
         except Exception as exc:
@@ -1087,7 +1410,25 @@ class AdaptiveLearningEngine:
                 scored.append((rank, insight))
 
         scored.sort(key=lambda pair: pair[0], reverse=True)
-        return [insight for _, insight in scored[:10]]
+        lexical = [insight for _, insight in scored[:10]]
+        if not self._semantic_recall or not self._embedding_model:
+            return lexical
+
+        semantic = self.get_insights_semantic(
+            phase=phase, tech_stack=tech_stack or [], limit=10
+        )
+        if not semantic:
+            return lexical
+        merged: list[LearnedInsight] = []
+        seen: set[str] = set()
+        for insight in [*semantic, *lexical]:
+            if insight.insight_id in seen:
+                continue
+            seen.add(insight.insight_id)
+            merged.append(insight)
+        merged = merged[:10]
+        self.record_recall(merged)
+        return merged
 
     def should_avoid_tool(self, tool_name: str) -> tuple[bool, list[str]]:
         if tool_name in self.negative_patterns:
@@ -1122,6 +1463,24 @@ class AdaptiveLearningEngine:
             )[:5],
         }
 
+    def _utility_map(self) -> dict[str, dict]:
+        if not _MEMORY_DB.exists():
+            return {}
+        try:
+            conn = _open_memory_db(read_only=True)
+            memory = MemoryManager()
+            memory.conn = conn
+            try:
+                raw = memory.get_utility("insight")
+            finally:
+                conn.close()
+        except Exception:
+            return {}
+        return {
+            ins.insight_id: raw.get(_insight_ref_id(ins.insight_id), {"recalls": 0, "hits": 0})
+            for ins in self.learned_insights
+        }
+
     @staticmethod
     def _normalize_condition_value(key: Any, value: Any) -> Any:
         key_name = str(key).strip().lower()
@@ -1144,6 +1503,11 @@ class AdaptiveLearningEngine:
         cond_str = ", ".join(f"{k}={v}" for k, v in conditions.items())
         tools_str = " → ".join(tool_sequence)
         return f"When [{cond_str}] → use [{tools_str}]"
+
+
+def _insight_ref_id(insight_id: str) -> int:
+    digest = hashlib.blake2b(insight_id.encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "big") & 0x7FFFFFFFFFFFFFFF
 
 
 # ── Per-Target Memory ────────────────────────────────────────────────────────
