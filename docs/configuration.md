@@ -62,15 +62,16 @@ code ~/.airecon/config.yaml
 #╚══════════════════════════════════════════════════════════╝
 
 # Quick Start:
-#   1. Set openai_base_url to your OpenAI-compatible gateway (must include /v1).
+#   1. Set openai_base_url to your gateway (must include /v1).
 #      - Local/offline: a local gateway (default http://localhost:20128/v1), vLLM, LiteLLM, or a gateway->Ollama
 #      - Hosted: any OpenAI/Anthropic/Gemini-compatible endpoint (set openai_api_key)
 #   2. Set openai_model to a model your gateway exposes (must support tool calling).
-#   3. Context sizes: 32768 (small/CTF), 65536 (standard), 131072+ (long-context hosted).
-#   4. Run: airecon start
+#   3. Set llm_provider to match the gateway: openai (default) or anthropic.
+#   4. Context sizes: 32768 (small/CTF), 65536 (standard), 131072+ (long-context hosted).
+#   5. Run: airecon start
 
 # ======================================
-# LLM Backend (OpenAI-compatible / LiteLLM / vLLM / hosted)
+# LLM Backend (OpenAI-compatible / Anthropic Messages / LiteLLM / vLLM / hosted)
 # ======================================
 # OpenAI-compatible API base URL. REQUIRED. Must include /v1. default (local gateway): http://localhost:20128/v1
 openai_base_url: "http://localhost:20128/v1"
@@ -80,6 +81,9 @@ openai_api_key: ""
 openai_model: ""
 # Whether the model supports native function/tool calling (REQUIRED for AIRecon to function).
 openai_supports_native_tools: true
+# LLM wire protocol the gateway speaks: openai = /v1/chat/completions (default),
+# anthropic = /v1/messages (real Claude, or a gateway exposing the Anthropic surface).
+llm_provider: openai
 
 # ======================================
 # LLM Tuning
@@ -142,10 +146,48 @@ allow_destructive_testing: false
 
 ## 3. LLM Backend Settings
 
+AIRecon speaks **two wire formats** behind one interface, selected by `llm_provider`:
+
+| `llm_provider` | Endpoint | Use for |
+|----------------|----------|---------|
+| `openai` (default) | `POST {base_url}/chat/completions` | OpenAI, and every OpenAI-compatible gateway (LiteLLM / vLLM / gateway→Ollama / hosted) |
+| `anthropic` | `POST {base_url}/messages` | Real Claude / the Anthropic Messages API, or a gateway that exposes the Anthropic-compatible surface |
+
+`base_url` **must include the `/v1` suffix** in both cases. Switching protocols is one line:
+
+```yaml
+# OpenAI-compatible gateway (default)
+openai_base_url: "http://localhost:20128/v1"
+openai_model: "gpt-4o"
+llm_provider: openai
+
+# Anthropic Messages API — real Claude, or a Claude-compatible gateway
+openai_base_url: "https://api.anthropic.com/v1"
+openai_api_key: "sk-ant-..."
+openai_model: "claude-sonnet-4"
+llm_provider: anthropic
+```
+
+> Anthropic mode maps AIRecon's conversation onto the Messages API automatically — `system` is extracted to the top-level `system` string, tool calls become `tool_use` blocks, tool results become `tool_result` blocks (with the same orphan-drop / id-binding rules as the OpenAI path), and `thinking` (`budget_tokens`) is requested when the agent decides to reason. Reasoning deltas surface as thinking exactly like the OpenAI path.
+
+---
+
+### `llm_provider`
+**Type:** string | **Default:** `"openai"`
+
+Which wire protocol the backend speaks. `openai` (default) uses `/v1/chat/completions`; `anthropic` uses `/v1/messages` (Claude / Anthropic Messages API). Any value other than `anthropic`/`claude` falls back to `openai`.
+
+```yaml
+llm_provider: "openai"      # default — OpenAI-compatible gateways
+llm_provider: "anthropic"   # Claude / Anthropic Messages API
+```
+
+---
+
 ### `openai_base_url`
 **Type:** string | **Default:** `"http://localhost:20128/v1"` | **Required**
 
-The OpenAI-compatible `/v1` endpoint AIRecon talks to. **Must include the `/v1` suffix.**
+The `/v1` endpoint AIRecon talks to (OpenAI-compatible, or Anthropic-compatible when `llm_provider: anthropic`). **Must include the `/v1` suffix.**
 
 ```yaml
 # local-gateway default (can proxy a local Ollama / vLLM)
@@ -778,8 +820,11 @@ AIRECON_OPENAI_TEMPERATURE=0.2 airecon start
 # Disable destructive testing
 AIRECON_ALLOW_DESTRUCTIVE_TESTING=false airecon start
 
-# Use a different Ollama endpoint
+# Use a different gateway endpoint
 AIRECON_OPENAI_BASE_URL=http://10.0.0.5:20128/v1 airecon start
+
+# Speak the Anthropic Messages API instead of OpenAI Chat Completions
+AIRECON_LLM_PROVIDER=anthropic airecon start
 
 # Override context window
 AIRECON_LLM_CONTEXT_WINDOW=65536 airecon start
@@ -863,6 +908,26 @@ llm_keep_alive: "60m"
 agent_max_tool_iterations: 800
 searxng_url: "http://localhost:8080"
 ```
+
+### Preset: Claude / Anthropic Messages API
+
+```yaml
+llm_provider: "anthropic"
+openai_base_url: "https://api.anthropic.com/v1"
+openai_api_key: "sk-ant-..."
+openai_model: "claude-sonnet-4"
+llm_context_window: 200000
+llm_context_window_small: 65536
+openai_temperature: 0.15
+openai_max_tokens: 16384
+llm_enable_thinking: true
+openai_supports_native_tools: true
+llm_timeout: 240.0
+command_timeout: 900.0
+agent_max_tool_iterations: 800
+```
+
+Use the same block against any gateway that exposes the Anthropic surface by pointing `openai_base_url` at it (keep `llm_provider: "anthropic"`).
 
 ### Preset: Passive / non-destructive assessment
 

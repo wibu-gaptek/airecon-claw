@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### Added — dual-protocol LLM client (OpenAI + Anthropic/Claude)
+- feat(llm): `LLMClient` now speaks **two** wire formats selected by a new `llm_provider` key. `openai` (default) keeps the existing `POST {base_url}/chat/completions` path; `anthropic` uses `POST {base_url}/messages` (Anthropic Messages API — real Claude, or any gateway exposing the Anthropic-compatible surface). Both yield the identical LLM-chunk contract, so the agent loop, executors and tools are untouched.
+- feat(llm): full Anthropic mapping — `system` is extracted to the top-level `system` string; tool calls become `tool_use` blocks and tool results become `tool_result` blocks (reusing the OpenAI path's FIFO id-binding and orphan-drop rules); consecutive same-role turns are coalesced for role-alternation; native tools convert to `input_schema`; thinking streams via `thinking_delta` and is requested with `thinking: {type: enabled, budget_tokens}` on the agent's `think` decision. Auth sends both `x-api-key` + `anthropic-version: 2023-06-01` and `Authorization: Bearer` for gateway compatibility. No SDK added (httpx only).
+- refactor(llm): the SSE loop was factored into a protocol-agnostic `_iter_stream` normalizer (`_iter_openai_stream` / `_iter_anthropic_stream`), so both backends share one accumulator and final-chunk builder. Reasoning degradation (`_maybe_degrade_reasoning`) also strips the Anthropic `thinking` param on an unsupported-parameter 400.
+- feat(config): new `llm_provider` key (`openai`|`anthropic`, default `openai`), surfaced in the generated config, config reference, and `AIRECON_LLM_PROVIDER` env override. Registered as essential so existing configs migrate on next load.
+
+### Fixed — Windows config file encoding & write
+- fix(config): `config.yaml` was read/written with the platform default codec, so on Windows the box-drawing header raised `'charmap' codec can't decode byte 0x90` — the config failed to parse **and** could not be rewritten, silently resetting to defaults (wiping `openai_model`). Both the reader and the atomic writer now use `encoding="utf-8"`.
+- fix(config): the atomic `os.replace()` of the temp config could fail with `WinError 5` on a transiently-locked home dir (OneDrive/AV). It now retries with backoff and falls back to a direct in-place write, so a needlessly locked directory can no longer make the config unwritable.
+
+### Added — tests
+- test(llm): `tests/proxy/test_llm_protocol.py` — Anthropic message/tool converters (system extraction, tool_use/tool_result pairing, FIFO id binding, orphan drop, role coalescing), Anthropic SSE parsing (thinking/text/tool_use + stop_reason/usage), OpenAI SSE regression, and auth-header selection.
+
 ## [v1.7.1-beta] - 2026-06-15
 
 ### Added — Zero-FP verification on the LLM finding path

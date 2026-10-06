@@ -1,13 +1,18 @@
-"""LLM backend for AIRecon (OpenAI-compatible).
+"""LLM backend for AIRecon (OpenAI + Anthropic compatible).
 
-AIRecon talks to a single OpenAI-compatible ``/v1/chat/completions`` gateway —
-for example LiteLLM, vLLM, or a hosted OpenAI/Anthropic-compatible endpoint. A
-local gateway can also proxy a local Ollama/LLM server, so there is no separate
+AIRecon talks to a single LLM gateway but can speak **two** wire formats, chosen
+by the ``llm_provider`` config key:
+
+* ``openai`` (default) → OpenAI Chat Completions, ``POST {base}/chat/completions``
+* ``anthropic`` → Anthropic Messages API, ``POST {base}/messages`` (real Claude,
+  or any gateway that exposes the Anthropic-compatible surface — e.g. 9router).
+
+The gateway may itself proxy a local Ollama/LLM server, so there is no separate
 native-LLM backend.
 
 ``LLMClient`` is fully self-contained: it owns the shared httpx client, the
 request semaphore, dynamic timeouts and the performance-recording hooks the rest
-of the agent relies on, and speaks OpenAI's wire format directly.
+of the agent relies on, and speaks the selected wire format directly (no SDK).
 
 The streaming method yields **LLM-shaped** chunks — dicts of the form
 ``{"message": {"content"/"thinking": ..., "tool_calls": [...]}, "done": bool}``
@@ -151,6 +156,146 @@ def _to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return converted
 
 
+def _to_anthropic_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Convert OpenAI tool schemas to Anthropic ``input_schema`` tools.
+
+    AIRecon builds tools as ``{"type": "function", "function": {name, description,
+    parameters}}``; Anthropic wants ``{name, description, input_schema}``.
+    """
+    out: list[dict[str, Any]] = []
+    for t in tools or []:
+        fn = t.get("function") if isinstance(t, dict) else None
+        if not isinstance(fn, dict):
+            if isinstance(t, dict) and t.get("name"):
+                out.append(
+                    {
+                        "name": t["name"],
+                        "description": t.get("description", ""),
+                        "input_schema": t.get("input_schema")
+                        or {"type": "object", "properties": {}},
+                    }
+                )
+            continue
+        out.append(
+            {
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "input_schema": fn.get("parameters")
+                or {"type": "object", "properties": {}},
+            }
+        )
+    return out
+
+
+def _to_anthropic_messages(
+    messages: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Sanitize AIRecon's conversation into the Anthropic Messages shape.
+
+    Returns ``(system_prompt, messages)``: Anthropic takes ``system`` as a
+    top-level string and requires ``user``/``assistant`` turns whose content is a
+    list of blocks. Tool calls become ``tool_use`` blocks; tool results become
+    ``user`` turns holding a ``tool_result`` block. Thinking blocks are NOT
+    replayed (Anthropic requires a ``signature`` we do not hold) — only live
+    streamed thinking reaches the agent loop.
+
+    Mirrors ``_to_openai_messages``'s tool_call_id FIFO binding and orphan-drop
+    rule, then coalesces consecutive same-role turns so strict Anthropic
+    gateways accept the alternation.
+    """
+    system_parts: list[str] = []
+    converted: list[dict[str, Any]] = []
+    pending_tool_ids: list[str] = []
+    emitted_call_ids: set[str] = set()
+
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            converted.append(
+                {"role": "user", "content": [{"type": "text", "text": str(msg)}]}
+            )
+            continue
+
+        role = msg.get("role", "user")
+
+        if role == "system":
+            text = msg.get("content", "")
+            if text:
+                system_parts.append(str(text))
+            continue
+
+        blocks: list[dict[str, Any]] = []
+
+        if role == "assistant" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                fn = tc.get("function", {}) or {}
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args) if args.strip() else {}
+                    except json.JSONDecodeError:
+                        args = {}
+                if not isinstance(args, dict):
+                    args = {}
+                call_id = tc.get("id") or f"call_{uuid.uuid4().hex[:24]}"
+                blocks.append(
+                    {
+                        "type": "tool_use",
+                        "id": call_id,
+                        "name": fn.get("name", ""),
+                        "input": args,
+                    }
+                )
+                pending_tool_ids.append(call_id)
+                emitted_call_ids.add(call_id)
+            converted.append({"role": "assistant", "content": blocks})
+            continue
+
+        if role == "tool":
+            tcid = msg.get("tool_call_id")
+            if not tcid and pending_tool_ids:
+                tcid = pending_tool_ids.pop(0)
+            if not tcid or tcid not in emitted_call_ids:
+                logger.debug(
+                    "Dropping orphaned tool result (tool_call_id=%r) with no "
+                    "matching assistant tool_use in payload",
+                    tcid,
+                )
+                continue
+            content = msg.get("content", "")
+            if not str(content).strip():
+                content = "[no output]"
+            converted.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tcid,
+                            "content": str(content),
+                        }
+                    ],
+                }
+            )
+            continue
+
+        content = msg.get("content", "")
+        if not str(content).strip():
+            # Strict gateways reject an empty text part; drop it (mirrors OpenAI path).
+            continue
+        blocks.append({"type": "text", "text": str(content)})
+        converted.append({"role": role, "content": blocks})
+
+    # Anthropic requires alternating user/assistant turns.
+    merged: list[dict[str, Any]] = []
+    for m in converted:
+        if merged and merged[-1]["role"] == m["role"]:
+            merged[-1]["content"].extend(m["content"])
+        else:
+            merged.append({"role": m["role"], "content": list(m["content"])})
+
+    return "\n\n".join(p for p in system_parts if p.strip()), merged
+
+
 # Hints like "reset after 6s", "retry after 10 seconds", "try again in 3s".
 _RETRY_AFTER_RE = re.compile(
     r"(?:reset|retry|again|available)[^0-9]{0,20}?(\d+(?:\.\d+)?)\s*(s|sec|second)",
@@ -210,7 +355,12 @@ class LLMClient:
         self.model = model or cfg.openai_model
 
         self._api_key = (cfg.openai_api_key or "").strip()
-        self._backend_name = "OpenAI-compatible"
+        provider = str(getattr(cfg, "llm_provider", "openai") or "openai").strip().lower()
+        self._provider = "anthropic" if provider in ("anthropic", "claude") else "openai"
+        self._is_anthropic = self._provider == "anthropic"
+        self._backend_name = (
+            "Anthropic-compatible" if self._is_anthropic else "OpenAI-compatible"
+        )
         self._supports_native_tools = bool(cfg.openai_supports_native_tools)
 
         # ── Deep-thinking support (restored for the OpenAI/gateway path) ──────
@@ -284,10 +434,19 @@ class LLMClient:
             logger.info("LLM httpx client initialized")
 
     # ── helpers ──────────────────────────────────────────────────────────────
+    def _endpoint(self) -> str:
+        return "/messages" if self._is_anthropic else "/chat/completions"
+
     def _auth_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
+        if not self._api_key:
+            return headers
+        if self._is_anthropic:
+            # Anthropic Messages API auth. Real Claude uses x-api-key; gateways
+            # such as 9router also accept the Bearer form, so send both.
+            headers["x-api-key"] = self._api_key
+            headers["anthropic-version"] = "2023-06-01"
+        headers["Authorization"] = f"Bearer {self._api_key}"
         return headers
 
     def _apply_options(
@@ -312,6 +471,9 @@ class LLMClient:
                     pass
         if max_tokens and max_tokens > 0:
             payload["max_tokens"] = int(max_tokens)
+        elif self._is_anthropic:
+            # Anthropic requires max_tokens.
+            payload["max_tokens"] = 4096
         if temperature is not None:
             payload["temperature"] = float(temperature)
 
@@ -348,9 +510,20 @@ class LLMClient:
             "adaptive": "medium",
         }.get(self._thinking_intensity, "medium")
 
+    _THINKING_BUDGETS = {"low": 1024, "medium": 4096, "high": 16000, "adaptive": 4096}
+
     def _apply_thinking(self, payload: dict[str, Any], think: bool) -> None:
         """Translate the agent's `think` decision into gateway request params."""
         if not self._enable_thinking:
+            return
+        if self._is_anthropic:
+            if not think:
+                return
+            budget = self._THINKING_BUDGETS.get(self._thinking_intensity, 4096)
+            max_tokens = int(payload.get("max_tokens") or 4096)
+            # Anthropic requires budget_tokens < max_tokens.
+            budget = max(1024, min(budget, max_tokens - 1))
+            payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
             return
         strat = self._thinking_strategy
         if strat == "reasoning_effort":
@@ -383,6 +556,7 @@ class LLMClient:
             "reasoning_effort" in b
             or "reasoning.effort" in b
             or "reasoning" in b
+            or "thinking" in b
         )
         if not mentions_reasoning:
             return False
@@ -412,6 +586,8 @@ class LLMClient:
             return False
         removed = False
         if payload.pop("reasoning_effort", None) is not None:
+            removed = True
+        if payload.pop("thinking", None) is not None:
             removed = True
         ctk = payload.get("chat_template_kwargs")
         if isinstance(ctk, dict) and "enable_thinking" in ctk:
@@ -529,22 +705,39 @@ class LLMClient:
     ) -> str:
         max_retries = max(0, max_retries)
         request_started = time.monotonic()
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": _to_openai_messages(messages),
-            "stream": False,
-        }
+        if self._is_anthropic:
+            system_prompt, anthropic_messages = _to_anthropic_messages(messages)
+            payload: dict[str, Any] = {
+                "model": self.model,
+                "messages": anthropic_messages,
+                "stream": False,
+            }
+            if system_prompt:
+                payload["system"] = system_prompt
+        else:
+            payload = {
+                "model": self.model,
+                "messages": _to_openai_messages(messages),
+                "stream": False,
+            }
         self._apply_options(payload, options)
 
         try:
             for attempt in range(max_retries + 1):
                 try:
                     timeout = self._get_dynamic_timeout(operation)
-                    resp = await self._post("/chat/completions", payload, timeout)
+                    resp = await self._post(self._endpoint(), payload, timeout)
                     data = resp.json()
 
                     content: str | None = None
-                    if isinstance(data, dict):
+                    if self._is_anthropic and isinstance(data, dict):
+                        parts = [
+                            b.get("text", "")
+                            for b in (data.get("content") or [])
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        ]
+                        content = "".join(parts) if parts else None
+                    elif isinstance(data, dict):
                         choices = data.get("choices") or []
                         if choices:
                             content = (choices[0].get("message") or {}).get("content")
@@ -635,6 +828,148 @@ class LLMClient:
         ):
             yield chunk
 
+    async def _iter_stream(
+        self,
+        resp: httpx.Response,
+        stop_requested_fn: Callable[[], bool] | None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Normalize an SSE response from either protocol into event dicts.
+
+        Yields ``{"kind": usage|finish|thinking|text|tool, ...}`` so the caller's
+        accumulator works identically for OpenAI ``chat.completion.chunk`` and
+        Anthropic ``message`` events.
+        """
+        if self._is_anthropic:
+            async for ev in self._iter_anthropic_stream(resp, stop_requested_fn):
+                yield ev
+            return
+        async for ev in self._iter_openai_stream(resp, stop_requested_fn):
+            yield ev
+
+    async def _iter_openai_stream(
+        self,
+        resp: httpx.Response,
+        stop_requested_fn: Callable[[], bool] | None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        async for raw_line in resp.aiter_lines():
+            if stop_requested_fn and stop_requested_fn():
+                return
+            if not raw_line:
+                continue
+            line = raw_line.strip()
+            if not line.startswith("data:"):
+                continue
+            data_str = line[len("data:"):].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                evt = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            if isinstance(evt.get("usage"), dict):
+                yield {"kind": "usage", "usage": evt["usage"]}
+
+            choices = evt.get("choices") or []
+            if not choices:
+                continue
+            choice0 = choices[0]
+            delta = choice0.get("delta") or {}
+            if choice0.get("finish_reason"):
+                yield {"kind": "finish", "reason": choice0["finish_reason"]}
+
+            # Reasoning models (o1, DeepSeek-R1, many hosted models) stream
+            # chain-of-thought in `reasoning_content`/`reasoning`, not `content`.
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if reasoning:
+                yield {"kind": "thinking", "text": reasoning}
+
+            content = delta.get("content")
+            if not content and delta.get("refusal"):
+                content = delta["refusal"]
+            if content:
+                yield {"kind": "text", "text": content}
+
+            for tc in delta.get("tool_calls") or []:
+                tc_fn = tc.get("function") or {}
+                yield {
+                    "kind": "tool",
+                    "index": tc.get("index", 0),
+                    "id": tc.get("id"),
+                    "name": tc_fn.get("name"),
+                    "args": tc_fn.get("arguments"),
+                }
+
+    async def _iter_anthropic_stream(
+        self,
+        resp: httpx.Response,
+        stop_requested_fn: Callable[[], bool] | None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        blocks: dict[int, dict[str, Any]] = {}
+        async for raw_line in resp.aiter_lines():
+            if stop_requested_fn and stop_requested_fn():
+                return
+            if not raw_line:
+                continue
+            line = raw_line.strip()
+            if not line.startswith("data:"):
+                continue
+            data_str = line[len("data:"):].strip()
+            if not data_str or data_str == "[DONE]":
+                continue
+            try:
+                evt = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            etype = evt.get("type")
+            if etype == "content_block_start":
+                block = evt.get("content_block") or {}
+                if block.get("type") == "tool_use":
+                    idx = evt.get("index", 0)
+                    blocks[idx] = {"id": block.get("id"), "name": block.get("name")}
+                    # Emit up front so a tool with empty input still registers.
+                    yield {
+                        "kind": "tool",
+                        "index": idx,
+                        "id": block.get("id"),
+                        "name": block.get("name"),
+                        "args": "",
+                    }
+            elif etype == "content_block_delta":
+                delta = evt.get("delta") or {}
+                dtype = delta.get("type")
+                if dtype == "thinking_delta" and delta.get("thinking"):
+                    yield {"kind": "thinking", "text": delta["thinking"]}
+                elif dtype == "text_delta" and delta.get("text"):
+                    yield {"kind": "text", "text": delta["text"]}
+                elif dtype == "input_json_delta":
+                    yield {
+                        "kind": "tool",
+                        "index": evt.get("index", 0),
+                        "id": blocks.get(evt.get("index", 0), {}).get("id"),
+                        "name": blocks.get(evt.get("index", 0), {}).get("name"),
+                        "args": delta.get("partial_json", ""),
+                    }
+            elif etype == "message_delta":
+                stop = (evt.get("delta") or {}).get("stop_reason")
+                if stop:
+                    yield {
+                        "kind": "finish",
+                        "reason": "tool_calls" if stop == "tool_use" else stop,
+                    }
+                use = evt.get("usage")
+                if isinstance(use, dict):
+                    yield {
+                        "kind": "usage",
+                        "usage": {
+                            "prompt_tokens": use.get("input_tokens", 0),
+                            "completion_tokens": use.get("output_tokens", 0),
+                        },
+                    }
+            elif etype == "message_stop":
+                break
+
     async def _chat_stream_impl(
         self,
         messages: list[dict[str, Any]],
@@ -646,20 +981,29 @@ class LLMClient:
         stop_requested_fn: Callable[[], bool] | None = None,
     ) -> AsyncIterator[Any]:
         cfg = get_config()
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": _to_openai_messages(messages),
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if tools:
-            # AIRecon already builds tools in OpenAI function-schema shape
-            # ({"type": "function", "function": {...}}), so pass them through.
-            payload["tools"] = tools
+        if self._is_anthropic:
+            system_prompt, anthropic_messages = _to_anthropic_messages(messages)
+            payload: dict[str, Any] = {
+                "model": self.model,
+                "messages": anthropic_messages,
+                "stream": True,
+            }
+            if system_prompt:
+                payload["system"] = system_prompt
+            if tools:
+                payload["tools"] = _to_anthropic_tools(tools)
+        else:
+            payload = {
+                "model": self.model,
+                "messages": _to_openai_messages(messages),
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+            if tools:
+                # AIRecon already builds tools in OpenAI function-schema shape
+                # ({"type": "function", "function": {...}}), so pass them through.
+                payload["tools"] = tools
         self._apply_options(payload, options)
-        # Restore "Deep Thinking Model Support" on the OpenAI/gateway path: turn
-        # the agent's per-iteration `think` decision into a real reasoning
-        # request (reasoning_effort or chat_template_kwargs.enable_thinking).
         self._apply_thinking(payload, think)
 
         overall_timeout = cfg.llm_timeout
@@ -677,7 +1021,7 @@ class LLMClient:
                     client = LLMClient._httpx_client
                     if client is None:
                         raise RuntimeError("HTTP client not initialized")
-                    url = f"{self._host}/chat/completions"
+                    url = f"{self._host}{self._endpoint()}"
                     timeout_obj = httpx.Timeout(
                         overall_timeout, connect=10.0, read=chunk_timeout, write=10.0
                     )
@@ -705,89 +1049,56 @@ class LLMClient:
                             ):
                                 continue
                             logger.error(
-                                "LLM backend STREAM /chat/completions -> HTTP %d: %s",
+                                "LLM backend STREAM %s -> HTTP %d: %s",
+                                self._endpoint(),
                                 resp.status_code,
                                 body,
                             )
                             raise LLMBackendHTTPError(
                                 resp.status_code,
                                 f"{self._backend_name} returned HTTP "
-                                f"{resp.status_code} for /chat/completions: {body}",
+                                f"{resp.status_code} for {self._endpoint()}: {body}",
                             )
-                        async for raw_line in resp.aiter_lines():
-                            if stop_requested_fn and stop_requested_fn():
-                                return
-                            if not raw_line:
+                        async for _ev in self._iter_stream(
+                            resp, stop_requested_fn
+                        ):
+                            if _ev["kind"] == "usage":
+                                usage = _ev["usage"]
                                 continue
-                            line = raw_line.strip()
-                            if not line.startswith("data:"):
+                            if _ev["kind"] == "finish":
+                                finish_reason = _ev["reason"]
                                 continue
-                            data_str = line[len("data:"):].strip()
-                            if data_str == "[DONE]":
-                                break
-                            try:
-                                evt = json.loads(data_str)
-                            except json.JSONDecodeError:
-                                continue
-
-                            if isinstance(evt.get("usage"), dict):
-                                usage = evt["usage"]
-
-                            choices = evt.get("choices") or []
-                            if not choices:
-                                continue
-                            choice0 = choices[0]
-                            delta = choice0.get("delta") or {}
-                            if choice0.get("finish_reason"):
-                                finish_reason = choice0["finish_reason"]
-
-                            # Reasoning models (o1, DeepSeek-R1, and many hosted
-                            # models behind LiteLLM) stream their
-                            # chain-of-thought in `reasoning_content` or
-                            # `reasoning` rather than `content`. Map it to an
-                            # LLM-style `thinking` chunk so the agent loop sees
-                            # real output instead of treating the turn as empty
-                            # and burning useless retries.
-                            reasoning = delta.get("reasoning_content") or delta.get(
-                                "reasoning"
-                            )
-                            if reasoning:
+                            if _ev["kind"] == "thinking":
                                 produced_any = True
                                 yield {
                                     "message": {
                                         "role": "assistant",
-                                        "thinking": reasoning,
+                                        "thinking": _ev["text"],
                                     },
                                     "done": False,
                                 }
-
-                            content = delta.get("content")
-                            # OpenAI (and some safety-tuned gateways) put refusal
-                            # text in a structured `refusal` field instead of
-                            # `content`; surface it so a refusal is not silently
-                            # dropped and mistaken for an empty reply.
-                            if not content and delta.get("refusal"):
-                                content = delta["refusal"]
-                            if content:
+                                continue
+                            if _ev["kind"] == "text":
                                 produced_any = True
                                 yield {
                                     "message": {
                                         "role": "assistant",
-                                        "content": content,
+                                        "content": _ev["text"],
                                     },
                                     "done": False,
                                 }
-
-                            for tc in delta.get("tool_calls") or []:
-                                idx = tc.get("index", 0)
-                                slot = tool_acc.setdefault(idx, {"name": "", "args": ""})
-                                if tc.get("id"):
-                                    tool_ids[idx] = tc["id"]
-                                fn = tc.get("function") or {}
-                                if fn.get("name"):
-                                    slot["name"] = fn["name"]
-                                if fn.get("arguments"):
-                                    slot["args"] += fn["arguments"]
+                                continue
+                            if _ev["kind"] == "tool":
+                                idx = _ev["index"]
+                                slot = tool_acc.setdefault(
+                                    idx, {"name": "", "args": ""}
+                                )
+                                if _ev.get("id"):
+                                    tool_ids[idx] = _ev["id"]
+                                if _ev.get("name"):
+                                    slot["name"] = _ev["name"]
+                                if _ev.get("args"):
+                                    slot["args"] += _ev["args"]
 
                 # Build the consolidated final chunk (LLM shape).
                 final_tool_calls: list[dict[str, Any]] = []

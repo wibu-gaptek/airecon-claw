@@ -69,6 +69,12 @@ _CONFIG_SCHEMA: dict[str, tuple[Any, str]] = {
         True,
         "Whether the remote model supports native function/tool calling. Claude/GPT/Gemini all support this — keep True.",
     ),
+    "llm_provider": (
+        "openai",
+        "LLM wire protocol the gateway speaks: openai = /v1/chat/completions, "
+        "anthropic = /v1/messages (Claude/Anthropic Messages API — real Claude, or "
+        "a gateway exposing the Anthropic-compatible surface).",
+    ),
     "llm_timeout": (
         180.0,
         "Total request timeout (seconds). 180s = 3 min. Increase to 300s for slow remote gateways or large models.",
@@ -808,7 +814,7 @@ DEFAULT_CONFIG = {key: value for key, (value, _) in _CONFIG_SCHEMA.items()}
 
 _CONFIG_CATEGORIES = [
     (
-        "LLM Backend (OpenAI-compatible / LiteLLM / vLLM / hosted)",
+        "LLM Backend (OpenAI-compatible / Anthropic Messages / LiteLLM / vLLM / hosted)",
         [
             "openai_base_url",
             "openai_api_key",
@@ -817,6 +823,7 @@ _CONFIG_CATEGORIES = [
             "openai_temperature",
             "openai_supports_thinking",
             "openai_supports_native_tools",
+            "llm_provider",
         ],
     ),
     (
@@ -1120,6 +1127,7 @@ _ESSENTIAL_CONFIG_KEYS: set[str] = {
     "openai_model",
     "openai_max_tokens",
     "openai_temperature",
+    "llm_provider",
     "proxy_host",
     "proxy_port",
     "llm_timeout",
@@ -1151,6 +1159,31 @@ _ESSENTIAL_CONFIG_KEYS: set[str] = {
     "memory_compression_summary_chars",
     "memory_compression_input_per_msg_chars",
 }
+
+
+def _replace_with_retry(tmp_name: str, filepath: Path) -> None:
+    """os.replace with retries for transient Windows locks (OneDrive/AV), then a
+    direct in-place write fallback. The atomic replace is preferred, but a
+    needlessly locked home dir must not make the config unwritable."""
+    import time as _time
+
+    last_err: Exception | None = None
+    for _ in range(5):
+        try:
+            os.replace(tmp_name, filepath)
+            return
+        except OSError as e:
+            last_err = e
+            _time.sleep(0.1)
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(Path(tmp_name).read_text(encoding="utf-8"))
+    except OSError:
+        with contextlib.suppress(Exception):
+            os.unlink(tmp_name)
+        if last_err is not None:
+            raise last_err
+        raise
 
 
 def _write_yaml_with_comments(config: dict, filepath: Path) -> None:
@@ -1234,9 +1267,9 @@ def _write_yaml_with_comments(config: dict, filepath: Path) -> None:
         dir=str(filepath.parent), prefix=f".{filepath.name}.", suffix=".tmp"
     )
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(payload)
-        os.replace(tmp_name, filepath)
+        _replace_with_retry(tmp_name, filepath)
     except Exception:
         with contextlib.suppress(Exception):
             os.unlink(tmp_name)
@@ -1252,6 +1285,7 @@ class Config:
     openai_temperature: float
     openai_supports_thinking: bool
     openai_supports_native_tools: bool
+    llm_provider: str
 
     proxy_host: str
     proxy_port: int
@@ -1472,7 +1506,7 @@ class Config:
 
         if config_file.exists():
             try:
-                with open(config_file, "r") as f:
+                with open(config_file, "r", encoding="utf-8") as f:
                     loaded = yaml.safe_load(f)
                     if loaded is None:
                         logger.warning(

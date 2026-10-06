@@ -26,7 +26,7 @@
 | OS | Linux, macOS, WSL2 on Windows |
 | Python | 3.12+ |
 | Docker | 20.10+ |
-| LLM backend | An OpenAI-compatible gateway reachable at `openai_base_url` (LiteLLM / vLLM / hosted; or a gateway → local Ollama). Model must support native tool calling. |
+| LLM backend | A gateway reachable at `openai_base_url` — OpenAI-compatible (LiteLLM / vLLM / hosted; or a gateway → local Ollama) or Anthropic Messages (`llm_provider: anthropic`). Model must support native tool calling. |
 | Storage | 40+ GB free (Docker image + tools; plus model weights if running locally) |
 
 ### Model guidance
@@ -38,17 +38,18 @@
 
 ## 2. Set up an OpenAI-compatible LLM gateway
 
-AIRecon talks to one **OpenAI-compatible** `/v1/chat/completions` endpoint. Pick whichever fits you — the rest of AIRecon is identical:
+AIRecon talks to one LLM gateway and can speak **two wire formats**, chosen by `llm_provider`. Pick whichever fits you — the rest of AIRecon is identical:
 
-- **Local / offline** — run a local OpenAI-compatible gateway, vLLM, or LiteLLM on your machine. a local gateway (e.g. via a proxy) can serve a local Ollama, so you keep a fully private setup. Default base URL: `http://localhost:20128/v1`.
-- **Hosted** — any OpenAI/Anthropic/Gemini-compatible gateway. You'll set `openai_api_key`.
+- **OpenAI-compatible** (`llm_provider: openai`, default) — `POST /v1/chat/completions`. Local/offline: run a local OpenAI-compatible gateway, vLLM, or LiteLLM (a gateway can serve a local Ollama for a fully private setup; default base URL `http://localhost:20128/v1`). Hosted: any OpenAI/Gemini-compatible gateway.
+- **Anthropic Messages** (`llm_provider: anthropic`) — `POST /v1/messages`. Real Claude, or any gateway exposing the Anthropic-compatible surface.
 
-You'll point AIRecon at it with three config keys (see step 8 and the [Configuration reference](configuration.md)):
+You'll point AIRecon at it with four config keys (see step 8 and the [Configuration reference](configuration.md)):
 
 ```yaml
 openai_base_url: "http://localhost:20128/v1"   # must include /v1
 openai_api_key: ""                              # set if your gateway requires one
 openai_model: "qwen3:8b"                         # any model your gateway exposes
+llm_provider: "openai"                          # or "anthropic" for /v1/messages (Claude)
 ```
 
 > **Tool calling is required**; reasoning is auto-detected at runtime (no model-name list). For a local model, run it behind the gateway first and confirm `GET <base_url>/models` responds.
