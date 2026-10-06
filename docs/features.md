@@ -31,7 +31,7 @@
 
 ## Deep Thinking Model Support
 
-AIRecon supports reasoning models that generate internal thoughts (`<think>`) before producing a final answer. This is useful for complex tasks such as:
+AIRecon supports reasoning models that generate internal thoughts (`<think>`) before producing a final answer, on **both** backends (`llm_provider: openai` or `anthropic`). This is useful for complex tasks such as:
 
 - Planning multi-stage attack chains
 - Analyzing vulnerability proof-of-concepts
@@ -45,7 +45,8 @@ When enabled, AIRecon keeps the reasoning stream separate from final output. The
 
 - `llm_enable_thinking: true|false` — master switch for extended thinking.
 - `llm_thinking_mode: low|medium|high|adaptive` — how often the agent spends a thinking turn (low = only deep tools, high = most iterations).
-- `llm_thinking_request_mode: auto|off|reasoning_effort|enable_thinking` — how the OpenAI-compatible gateway is asked to reason:
+- `llm_provider: openai|anthropic` — wire protocol: `openai` = `/v1/chat/completions`, `anthropic` = `/v1/messages` (Claude / Anthropic Messages API). Reasoning is surfaced as thinking on both.
+- `llm_thinking_request_mode: auto|off|reasoning_effort|enable_thinking` — how the **OpenAI-compatible** gateway is asked to reason (in `anthropic` mode AIRecon instead sends the Messages-API `thinking: {type: enabled, budget_tokens}` parameter):
   - `auto` (default) detects from the model name — sends `reasoning_effort` to o-series/gpt-5/gemini-thinking/grok-reasoning/QwQ/DeepSeek-R1 and `chat_template_kwargs.enable_thinking` to Qwen3/GLM/vLLM-hosted models, and stays silent for plain models (gpt-4o, gemini-flash) that would reject reasoning params.
   - `off` never sends reasoning params (use for non-reasoning models).
   - `reasoning_effort` / `enable_thinking` force a specific strategy.

@@ -101,6 +101,8 @@ AIRecon works with **any model your gateway exposes** (GPT, Claude, Gemini, Qwen
 >
 > **Reasoning is auto-detected.** In `auto` mode AIRecon sends the OpenAI-standard `reasoning_effort` and, if the backend rejects it (HTTP 400 unsupported-parameter), strips it and remembers — so reasoning models think, plain models don't break. No model-name list to maintain.
 
+> **Two protocols, one client.** Set `llm_provider: openai` (default) for `/v1/chat/completions` gateways, or `llm_provider: anthropic` for the Anthropic Messages API (`/v1/messages`) — real Claude, or a Claude-compatible gateway. Tool calls, tool results and reasoning are mapped to each wire format automatically.
+
 **Quality guidance (independent of provider):**
 - **Strong reasoning + tool calling** (e.g. GPT-5/o-series, Claude Sonnet/Opus 4.x, Gemini 2.5, Qwen3 ≥32B, DeepSeek-R) → reliable full recon pipelines.
 - **Mid models (8B–14B local)** → usable for simple tasks; expect more tool-call errors and hallucinations.
